@@ -7022,6 +7022,7 @@ async function pintarTuDia() {
         ${!pasado && conSitio > 1 ? '<button class="btn sec" id="tdordenar" title="Ordena las citas abiertas para recorrer menos kilómetros. Las que tienen hora fija se respetan.">Ordenar por cercanía</button>' : ''}
         ${esHoy && !j && abiertas ? '<button class="btn" id="tdempezar">▶ Empezar jornada</button>' : ''}
         ${esHoy && j ? '<button class="btn dang" id="tdterminar">Terminar jornada</button>' : ''}
+        ${pasado && abiertas ? '<button class="btn" id="tdrepro">Reprogramar pendientes</button>' : ''}
       </div>
     </div>
     ${esHoy && j ? `<div class="tdjornada">● Jornada en curso desde hace ${durTxt(Date.now() - j.inicio)}. Registra cada visita al terminarla.</div>` : ''}
@@ -7034,7 +7035,9 @@ async function pintarTuDia() {
         <span class="ic tdh" title="${c.hora ? 'Hora fijada' : 'Hora estimada según el orden'}" style="background:${EST_COL[c.estado]}1f;color:${EST_COL[c.estado]}">${hora}</span>
         <span class="tx"><b>${c.urgente ? '<span class="pill p-urg">Urgente</span> ' : ''}${esc(c.nombre)}</b>
           <span class="sm">${esc([c.centro_nombre, c.municipio].filter(Boolean).join(' · ') || 'Sin centro')}${!xyCita(c) && abierta ? ' · <span style="color:var(--warn)">sin ubicación</span>' : ''}</span>
-          <span class="sm">${pillCita(c.estado)}${c.origen ? ' · ' + esc(c.origen) : ''}${c.nota ? ' · ' + esc(c.nota) : ''}</span></span>
+          <span class="sm">${pillCita(c.estado)}${c.origen ? ' · ' + esc(c.origen) : ''}${c.nota ? ' · ' + esc(c.nota) : ''}</span>
+          ${abierta && TD_INFO[c.id] && TD_INFO[c.id].aviso ? `<span class="sm tdaviso">⚠ ${esc(TD_INFO[c.id].aviso)}</span>`
+            : abierta && TD_INFO[c.id] && TD_INFO[c.id].ventanas && TD_INFO[c.id].ventanas.length ? `<span class="sm tdvent">Consulta ${esc(txtVentanas(TD_INFO[c.id].ventanas))}${TD_INFO[c.id].espera ? ` · esperas ${TD_INFO[c.id].espera} min` : ''}</span>` : ''}</span>
         <span class="acts tdacts" style="margin:0">
           ${abierta && !pasado ? `
             <span class="tdord">
@@ -7051,9 +7054,11 @@ async function pintarTuDia() {
 
   if ($('tdempezar')) $('tdempezar').onclick = empezarJornada;
   if ($('tdterminar')) $('tdterminar').onclick = terminarJornada;
+  if ($('tdrepro')) $('tdrepro').onclick = () => reprogramarCitas(mias.filter(c => CITA_ABIERTA.includes(c.estado)), 'Pendientes del ' + fechaCorta(fecha), 'Sin visitar ese día');
   if ($('tdordenar')) $('tdordenar').onclick = async () => {
     const nuevo = ordenarPorCercania(mias);
-    if (await guardarOrden(nuevo)) { toast('Citas ordenadas por cercanía'); cargarAgenda(); }
+    const nf = ordenarPorCercania.fuera || 0;
+    if (await guardarOrden(nuevo)) { toast(nf ? `Ordenadas · ${nf} no caben en su horario o en el tuyo y quedan al final` : 'Citas ordenadas por cercanía'); cargarAgenda(); }
   };
   $('agcuerpo').querySelectorAll('[data-tdf]').forEach(el => {
     const abrir = e => { if (e.target.closest('button, a, .tdmenu')) return; abrirFicha(el.dataset.tdf); };
@@ -7337,6 +7342,345 @@ if (EN_PRUEBAS) {
   const mostrarAppV2240 = mostrarApp;
   mostrarApp = function (perfil) { mostrarAppV2240(perfil); pintarFranjaPruebas(); };
 }
+
+
+/* ============================================================
+   DLC OS 2.0 · v2.25.0 · Rutas y Agenda, bloque 2:
+   horario de consulta en la planificación, reprogramación de lo
+   no visitado y semana en cuadrícula
+   ============================================================ */
+
+/* ---------------- horarios de consulta ---------------- */
+
+const LETRA_DIA = f => 'DLMXJVS'[new Date(f + 'T12:00:00').getDay()];
+const txtMin = m => hm(m);
+
+/**
+ * Franjas de consulta de un médico en una fecha, en minutos.
+ * null → no sabemos su horario (sin restricción) · [] → ese día no pasa consulta · [[ini, fin], …]
+ */
+function ventanasDe(dias, fecha) {
+  const d = dias || {};
+  if (!Object.keys(d).some(k => d[k])) return null;
+  const t = d[LETRA_DIA(fecha)];
+  if (!t) return [];
+  const out = [];
+  String(t).split(/[;,/]| y /i).forEach(parte => {
+    const r = /(\d{1,2})(?:[:.h](\d{2}))?\s*[-–a]\s*(\d{1,2})(?:[:.h](\d{2}))?/.exec(parte);
+    if (r) out.push([+r[1] * 60 + (+r[2] || 0), +r[3] * 60 + (+r[4] || 0)]);
+    else if (/mañana/i.test(parte)) out.push([9 * 60, 14 * 60]);
+    else if (/tarde/i.test(parte)) out.push([15 * 60, 20 * 60]);
+  });
+  return out.length ? out.sort((a, b) => a[0] - b[0]) : [[0, 24 * 60]];
+}
+const txtVentanas = v => v && v.length ? v.map(([a, b]) => `${txtMin(a)}–${txtMin(b)}`).join(' y ') : '';
+
+/** Primer minuto en que se puede empezar la visita llegando a «llegada», o null si no hay hueco. */
+function inicioPosible(it, llegada, dura) {
+  if (it.fija != null) return llegada <= it.fija + 10 ? Math.max(llegada, it.fija) : null;
+  if (!it.ventanas) return llegada;
+  for (const [a, b] of it.ventanas) { const s = Math.max(llegada, a); if (s + dura <= b) return s; }
+  return null;
+}
+
+/**
+ * Ordena visitas respetando franjas de consulta y horas fijadas.
+ * items: { id, xy, ventanas, fija, ref }. Devuelve { seq: [{it, llegada, ini, fin}], fuera: [{it, motivo}], fin }
+ */
+function programarVisitas(items, t0) {
+  const cfg = PLANCFG(), sal = salidaUsuario(), tope = minHora(cfg.tope), dura = cfg.visita;
+  let pos = [sal.lat, sal.lon], t = t0;
+  const seq = [], fuera = [];
+  let pend = [];
+  items.forEach(it => {
+    if (it.ventanas && !it.ventanas.length) fuera.push({ it, motivo: 'no pasa consulta este día' });
+    else if (!it.xy) fuera.push({ it, motivo: 'sin ubicación' });
+    else pend.push(it);
+  });
+  const llegadaA = (it, desde, tt, primera) => {
+    const mismo = !primera && desde[0] === it.xy[0] && desde[1] === it.xy[1];
+    return tt + (mismo ? 0 : minutosEntre(desde, it.xy) + cfg.parada);
+  };
+  while (pend.length) {
+    let mejor = null;
+    const fijas = pend.filter(x => x.fija != null).sort((a, b) => a.fija - b.fija);
+    for (const it of pend) {
+      const lleg = llegadaA(it, pos, t, !seq.length);
+      const ini = inicioPosible(it, lleg, dura);
+      if (ini == null || ini + dura > tope) continue;
+      // No elegir algo que haga llegar tarde a la próxima cita con hora fijada
+      if (it.fija == null && fijas.length) {
+        const f = fijas[0];
+        if (llegadaA(f, it.xy, ini + dura, false) > f.fija + 10) continue;
+      }
+      const coste = ini - t;
+      if (!mejor || coste < mejor.coste) mejor = { it, lleg, ini, coste };
+    }
+    if (!mejor) break;
+    seq.push({ it: mejor.it, llegada: mejor.lleg, ini: mejor.ini, fin: mejor.ini + dura });
+    t = mejor.ini + dura; pos = mejor.it.xy;
+    pend = pend.filter(x => x !== mejor.it);
+  }
+  pend.forEach(it => {
+    const v = it.ventanas;
+    fuera.push({ it, motivo: it.fija != null ? 'no llegas a la hora fijada'
+      : v && v.every(([, b]) => b <= t) ? `su consulta (${txtVentanas(v)}) ya habrá acabado`
+      : 'no cabe antes de tu hora tope' });
+  });
+  return { seq, fuera, fin: t + minutosEntre(pos, [sal.lat, sal.lon]) };
+}
+
+async function conHorarios(lista) {
+  const faltan = lista.filter(m => !('dias' in m)).map(m => m.id);
+  if (!faltan.length) return lista;
+  const { data } = await db.rpc('horarios_medicos', { p_ids: faltan });
+  const por = {}; (data || []).forEach(h => por[h.id] = h);
+  return lista.map(m => por[m.id] ? Object.assign({}, m, { dias: por[m.id].dias || {} }) : m);
+}
+
+/* ---------------- plan de ruta con horarios ---------------- */
+
+async function construirPlan(conXY, rutaId, btn, opts) {
+  opts = opts || {};
+  ULTIMO_PLAN = { conXY, rutaId, opts };
+  const cfg = PLANCFG(), sal = salidaUsuario();
+  const fecha = opts.manana ? siguienteLaborable() : hoyISO();
+  const ahora = new Date(), minAhora = ahora.getHours() * 60 + ahora.getMinutes();
+  const salidaCfg = minHora(cfg.salida), tope = minHora(cfg.tope);
+  const t0 = opts.manana ? salidaCfg : Math.max(salidaCfg, Math.ceil(minAhora / 5) * 5);
+
+  if (t0 >= tope) {
+    const op = await elegirOpcion('Ya ha pasado tu horario de ruta de hoy',
+      `Tu horario es de ${cfg.salida} a ${cfg.tope} y ahora son las ${hm(minAhora)}.\n\nPuedes planificar la ruta para el ${fechaLarga(new Date(siguienteLaborable() + 'T00:00:00'))} o cambiar tu horario.`,
+      [{ k: 'no', t: 'Cancelar', cls: 'sec' }, { k: 'horario', t: '⚙ Cambiar horario', cls: 'sec' }, { k: 'manana', t: 'Planificar para mañana' }]);
+    if (op === 'horario') abrirHorarioPlan();
+    if (op === 'manana') construirPlan(conXY, rutaId, btn, { manana: true });
+    return;
+  }
+
+  const meds = await conHorarios(conXY);
+  const items = meds.map(m => ({ id: m.id, ref: m, xy: m.lat != null && m.lon != null ? [+m.lat, +m.lon] : null,
+    ventanas: ventanasDe(m.dias, fecha), fija: null }));
+  const { seq, fuera, fin } = programarVisitas(items, t0);
+
+  if (!seq.length) {
+    const noDia = fuera.filter(f => f.motivo === 'no pasa consulta este día').length;
+    const op = await elegirOpcion('No cabe ninguna visita',
+      (noDia === fuera.length ? `Ninguno de estos ${fuera.length} médicos pasa consulta el ${fechaLarga(new Date(fecha + 'T00:00:00'))}.`
+        : `Con tu horario (${cfg.salida}–${cfg.tope}) y las horas de consulta no da tiempo a ninguna visita.`),
+      [{ k: 'no', t: 'Cancelar', cls: 'sec' }, { k: 'horario', t: '⚙ Cambiar horario', cls: 'sec' }].concat(opts.manana ? [] : [{ k: 'manana', t: 'Probar para mañana' }]));
+    if (op === 'horario') abrirHorarioPlan();
+    if (op === 'manana') construirPlan(conXY, rutaId, btn, { manana: true });
+    return;
+  }
+
+  // Visitas seguidas en el mismo sitio forman una parada
+  const paradas = [];
+  seq.forEach(s => {
+    const m = Object.assign({}, s.it.ref, { horaPlan: s.ini, ventanas: s.it.ventanas });
+    const ult = paradas[paradas.length - 1];
+    if (ult && ult.xy[0] === s.it.xy[0] && ult.xy[1] === s.it.xy[1]) { ult.medicos.push(m); ult.fin = s.fin; }
+    else paradas.push({ centro: m.centro_nombre || 'Consulta privada', municipio: m.municipio, dir: m.direccion,
+      xy: s.it.xy, medicos: [m], llegada: s.ini, fin: s.fin });
+  });
+  PLAN = { rutaId, salida: sal, paradas, fin, fecha, inicio: t0, fuera: fuera.map(f => ({ m: f.it.ref, motivo: f.motivo })) };
+  if (TAB !== 'rutas') ir('rutas');
+  pintarPlan();
+  setTimeout(() => $('rplan') && $('rplan').scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
+}
+
+pintarPlan = (orig => function () {
+  orig();
+  if (!PLAN || !$('rplan')) return;
+  // Hora de cada médico y su franja de consulta
+  $('rplan').querySelectorAll('.lista > .item').forEach((el, i) => {
+    const p = PLAN.paradas[i]; if (!p) return;
+    const linea = el.querySelectorAll('.tx .sm')[1];
+    if (linea) linea.innerHTML = p.medicos.map(m => `<span class="pmed"><b>${m.horaPlan != null ? hm(m.horaPlan) : ''}</b> ${esc(m.nombre)}${
+      m.ventanas && m.ventanas.length ? ` <span class="pvent">consulta ${txtVentanas(m.ventanas)}</span>` : ''}</span>`).join('');
+  });
+  const fuera = PLAN.fuera || [];
+  if (fuera.length) {
+    $('rplan').querySelector('.card .lista').insertAdjacentHTML('afterend', `<div class="planfuera">
+      <h3>Se quedan fuera · ${fuera.length}</h3>
+      <div class="lista">${fuera.slice(0, 30).map(f => `<div class="item" style="cursor:default">
+        <span class="ic w">!</span><span class="tx"><b>${esc(f.m.nombre)}</b>
+          <span class="sm">${esc(f.motivo)}${f.m.municipio ? ' · ' + esc(f.m.municipio) : ''}</span></span></div>`).join('')}
+        ${fuera.length > 30 ? `<div class="sm" style="padding:6px 12px">y ${fuera.length - 30} más</div>` : ''}</div></div>`);
+  }
+})(pintarPlan);
+
+/* ---------------- Tu día: horas estimadas respetando las consultas ---------------- */
+
+let TD_INFO = {};
+
+function estimarDia(citas, fecha) {
+  const cfg = PLANCFG(), sal = salidaUsuario(), dura = cfg.visita;
+  const ahora = new Date(), minAhora = ahora.getHours() * 60 + ahora.getMinutes();
+  let t = minHora(cfg.salida);
+  if (fecha === hoyISO()) t = Math.max(t, Math.ceil(minAhora / 5) * 5);
+  let pos = [sal.lat, sal.lon], primera = true;
+  const est = {};
+  TD_INFO = {};
+  citas.forEach(c => {
+    const xy = xyCita(c);
+    if (!CITA_ABIERTA.includes(c.estado)) { if (xy) pos = xy; return; }
+    const it = { xy, ventanas: ventanasDe(c.dias, fecha), fija: minHora(c.hora) };
+    let lleg = t;
+    if (xy) { const mismo = !primera && pos[0] === xy[0] && pos[1] === xy[1]; lleg = t + (mismo ? 0 : minutosEntre(pos, xy) + cfg.parada); pos = xy; }
+    primera = false;
+    let ini = inicioPosible(it, lleg, dura);
+    const info = { ventanas: it.ventanas };
+    if (ini == null) {
+      ini = it.fija != null ? Math.max(lleg, it.fija) : lleg;
+      info.aviso = it.fija != null ? 'llegarías tarde a la hora fijada'
+        : it.ventanas && !it.ventanas.length ? 'ese día no pasa consulta'
+        : `fuera de su horario de consulta (${txtVentanas(it.ventanas)})`;
+    } else if (ini > lleg + 5 && it.ventanas) info.espera = ini - lleg;
+    est[c.id] = ini;
+    TD_INFO[c.id] = info;
+    t = ini + dura;
+  });
+  return { est, fin: t + minutosEntre(pos, [sal.lat, sal.lon]), tope: minHora(cfg.tope) };
+}
+
+function ordenarPorCercania(citas) {
+  const fecha = (citas[0] && citas[0].fecha) || AG_FECHA;
+  const cfg = PLANCFG(), ahora = new Date(), minAhora = ahora.getHours() * 60 + ahora.getMinutes();
+  let t0 = minHora(cfg.salida);
+  if (fecha === hoyISO()) t0 = Math.max(t0, Math.ceil(minAhora / 5) * 5);
+  const cerradas = citas.filter(c => !CITA_ABIERTA.includes(c.estado));
+  const abiertas = citas.filter(c => CITA_ABIERTA.includes(c.estado));
+  const items = abiertas.map(c => ({ id: c.id, ref: c, xy: xyCita(c), ventanas: ventanasDe(c.dias, fecha), fija: minHora(c.hora) }));
+  // Para ordenar no se descarta a nadie por la hora tope: se ordena todo lo posible
+  const { seq, fuera } = programarVisitas(items, t0);
+  ordenarPorCercania.fuera = fuera.length;
+  return cerradas.concat(seq.map(s => s.it.ref), fuera.map(f => f.it.ref));
+}
+
+/* ---------------- reprogramar lo no visitado ---------------- */
+
+async function reprogramarCitas(citas, titulo, texto) {
+  if (!citas.length) return false;
+  const conH = await conHorarios(citas.map(c => Object.assign({ id: c.medico_id }, 'dias' in c ? { dias: c.dias } : {})));
+  const dias = {}; conH.forEach(h => dias[h.id] = h.dias || {});
+  const base = hoyISO();
+  const filas = citas.map(c => ({ c, fecha: proximoDiaConsulta(dias[c.medico_id], c.fecha > base ? c.fecha : base),
+    horario: Object.keys(dias[c.medico_id] || {}).filter(k => (dias[c.medico_id] || {})[k]).join(' ') }));
+  return new Promise(res => {
+    $('dbody').innerHTML = `
+      <div class="fh"><div><h2>${esc(titulo)}</h2><div class="sm">${esc(texto)}</div></div>
+        <button class="x" data-cerrar aria-label="Cerrar">✕</button></div>
+      <p class="sm">Te propongo el próximo día que cada médico pasa consulta. Cambia la fecha si quieres o desmarca los que no quieras mover.</p>
+      <div class="lista reprog" data-nosucio>${filas.map((f, i) => `<div class="item" style="cursor:default">
+        <input type="checkbox" data-rpi="${i}" checked aria-label="Mover">
+        <span class="tx"><b>${esc(f.c.nombre)}</b>
+          <span class="sm">${esc([f.c.centro_nombre, f.c.municipio].filter(Boolean).join(' · '))}${f.c.fecha < base ? ' · era el ' + fechaCorta(f.c.fecha) : ''}</span>
+          <span class="sm">${f.horario ? 'Pasa consulta: ' + esc(f.horario) : 'Sin días de consulta conocidos'}</span></span>
+        <input type="date" data-rpf="${i}" value="${f.fecha}" min="${base}"></div>`).join('')}</div>
+      <div class="acts" style="justify-content:flex-end">
+        <button class="btn sec" id="rpno">Dejarlas como están</button>
+        <button class="btn" id="rpok">Mover las marcadas</button></div>`;
+    const cerrar = v => { $('dlg').close(); res(v); };
+    $('rpno').onclick = () => cerrar(false);
+    $('rpok').onclick = async ev => {
+      ev.target.disabled = true; ev.target.textContent = 'Moviendo…';
+      let n = 0;
+      for (let i = 0; i < filas.length; i++) {
+        if (!$('dbody').querySelector(`[data-rpi="${i}"]`).checked) continue;
+        const f = $('dbody').querySelector(`[data-rpf="${i}"]`).value; if (!f) continue;
+        const { data: r } = await db.rpc('aplazar_cita', { p_id: filas[i].c.id, p_fecha: f, p_hora: null, p_origen: 'Reprogramada' });
+        if (r && r.ok) n++;
+      }
+      toast(n ? `${n} ${n === 1 ? 'cita movida' : 'citas movidas'}` : 'No se ha movido ninguna');
+      cerrar(n > 0);
+      cargarAgenda(); cargarInicio(); pintarRutaBarra();
+    };
+    $('dlg').showModal();
+  });
+}
+
+async function terminarJornada() {
+  const j = jornadaActiva(); if (!j) return;
+  invalidarCache();
+  const citas = await citasDelDia(hoyISO());
+  const hechas = citas.filter(c => c.estado === 'Visitada').length;
+  const abiertas = citas.filter(c => CITA_ABIERTA.includes(c.estado));
+  const ok = await preguntar(`Tiempo: ${durTxt(Date.now() - j.inicio)} · Visitadas: ${hechas} de ${citas.filter(c => !['Descartada', 'Aplazada'].includes(c.estado)).length}` +
+    (abiertas.length ? `\n\nTe quedan ${abiertas.length} ${abiertas.length === 1 ? 'cita abierta' : 'citas abiertas'}. Al terminar te propongo a qué día moverlas.` : ''),
+    { titulo: '¿Terminar la jornada?', ok: 'Terminar jornada' });
+  if (!ok) return;
+  localStorage.removeItem(JKEY());
+  pintarRutaBarra();
+  toast(`Jornada terminada · ${hechas} visitadas`);
+  if (abiertas.length) await reprogramarCitas(abiertas, 'Lo que ha quedado pendiente hoy', `${abiertas.length} sin visitar`);
+  if (TAB === 'agenda') cargarAgenda();
+  if (TAB === 'rutas') cargarRutas();
+}
+
+/* ---------------- semana en cuadrícula ---------------- */
+
+async function pintarSemanaAgenda() {
+  const desde = lunesDe(AG_FECHA), hasta = isoMas(desde, 6);
+  const todos = PERFIL.rol === 'Administrador';
+  const r = await rpcCache('agenda_rango', { p_desde: desde, p_hasta: hasta, p_usuario: todos ? null : PERFIL.id }, 'agenda-' + desde);
+  if (AG_MODO !== 'semana') return;
+  const porDia = {};
+  (r.data || []).forEach(c => (porDia[c.fecha] = porDia[c.fecha] || []).push(c));
+  const dias = Array.from({ length: 7 }, (_, i) => isoMas(desde, i));
+  $('agcuerpo').innerHTML = `<h2 style="padding:14px 16px 0">Semana del ${fechaCorta(desde)} al ${fechaCorta(hasta)}</h2>
+    <div class="semwrap"><div class="mes sem">
+      ${['L', 'M', 'X', 'J', 'V', 'S', 'D'].map(d => `<span class="mesdow">${d}</span>`).join('')}
+      ${dias.map(f => {
+        const l = (porDia[f] || []).filter(c => !['Descartada', 'Aplazada'].includes(c.estado));
+        const hechas = l.filter(c => c.estado === 'Visitada').length;
+        const d = new Date(f + 'T12:00:00');
+        return `<div class="mesdia semdia ${f === hoyISO() ? 'hoy' : ''} ${d.getDay() === 0 || d.getDay() === 6 ? 'finde' : ''}" data-semdia="${f}" role="button" tabindex="0">
+          <div class="semcab"><b>${d.getDate()}</b>${l.length ? `<span class="mespunto">${hechas}/${l.length}</span>` : ''}
+            ${f >= hoyISO() ? `<button class="semmas" data-semnueva="${f}" aria-label="Nueva cita el ${fechaCorta(f)}" title="Nueva cita">+</button>` : ''}</div>
+          <div class="semcitas">${l.slice(0, 8).map(c => `<span class="semcita" data-semficha="${c.medico_id}" title="${esc(c.nombre)} · ${esc(c.estado)}"
+              style="border-left-color:${EST_COL[c.estado] || 'var(--muted)'}">
+              ${c.hora ? `<i>${esc(String(c.hora).slice(0, 5))}</i>` : ''}${esc(String(c.nombre).split(',')[0])}${todos && c.usuario_id !== PERFIL.id && c.usuario ? ` <em>${esc(iniciales(c.usuario))}</em>` : ''}</span>`).join('')}
+            ${l.length > 8 ? `<span class="sm">y ${l.length - 8} más</span>` : ''}</div>
+        </div>`;
+      }).join('')}
+    </div></div>`;
+  $('agcuerpo').querySelectorAll('[data-semdia]').forEach(el => {
+    const abrir = e => {
+      if (e.target.closest('[data-semnueva]')) { nuevaCita(null, e.target.closest('[data-semnueva]').dataset.semnueva); return; }
+      if (e.target.closest('[data-semficha]')) { abrirFicha(e.target.closest('[data-semficha]').dataset.semficha); return; }
+      AG_FECHA = el.dataset.semdia; AG_MODO = 'dia'; cargarAgenda();
+    };
+    el.onclick = abrir; el.onkeydown = e => { if (e.key === 'Enter') abrir(e); };
+  });
+}
+
+/* ---------------- enganches en la agenda ---------------- */
+
+cargarAgenda = (orig => async function () {
+  await orig();
+  if (TAB !== 'agenda') return;
+  if (AG_MODO === 'semana') await pintarSemanaAgenda();
+  // Pendientes de días anteriores: reprogramar todas de una vez
+  const pend = $('agpend');
+  if (pend && pend.querySelector('h2') && !$('agrepro')) {
+    pend.querySelector('p.sm').insertAdjacentHTML('afterend', '<div class="acts" style="padding:0 16px 8px"><button class="btn" id="agrepro">Reprogramar todas</button></div>');
+    $('agrepro').onclick = async () => {
+      const { data } = await RPC_ORIG('pendientes_ruta', {});
+      reprogramarCitas(data || [], 'Pendientes de días anteriores', `${(data || []).length} sin visitar`);
+    };
+  }
+})(cargarAgenda);
+
+/* ---------------- ayudas ---------------- */
+
+AYUDA.agenda[2].splice(1, 1,
+  'La hora con «~» es una estimación según el orden, tu horario, los desplazamientos y el <b>horario de consulta</b> de cada médico: si llegas antes de que abra, cuenta la espera. Una hora sin «~» es una hora fijada.',
+  'Si una cita queda fuera del horario de consulta del médico, se marca en naranja. <b>Ordenar por cercanía</b> tiene en cuenta esos horarios.');
+AYUDA.agenda[2].push('Al <b>terminar la jornada</b>, lo no visitado se puede mover de golpe al próximo día que cada médico pasa consulta. Lo mismo con los pendientes de días anteriores.',
+  'La vista de <b>semana</b> muestra los siete días en cuadrícula: pulsa un día para verlo, un médico para abrir su ficha o «+» para añadir una cita.');
+AYUDA.rutas[2].splice(1, 1,
+  'El plan respeta los <b>días y horas de consulta</b> de cada médico (los de su ficha): no te lo propone un día que no pasa consulta ni fuera de su horario. Los que no caben aparecen en «Se quedan fuera» con el motivo.');
 
 pintarConexion();
 vaciarCola();
