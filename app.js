@@ -7299,46 +7299,38 @@ function pintarFranjaPruebas() {
       <button class="ai" data-ayuda="pruebas" aria-label="Qué es el entorno de pruebas">i</button>
       <span class="prpunto" id="prpunto"></span></span>
     ${admin ? `<span class="acts" style="margin:0">
-      <button class="btn sec" id="prmaestro" title="Guarda cómo están ahora todos los datos de pruebas, para poder volver a este punto cuando quieras">📌 Guardar punto de partida</button>
-      <button class="btn" id="prreset" title="Deshace todo lo que se ha hecho en pruebas desde el último punto de partida guardado">↺ Volver al punto de partida</button></span>` : ''}`;
+      <button class="btn" id="prreset" title="Deshace todo lo hecho en pruebas y deja los datos como se cargaron de producción">↺ Volver a los datos de partida</button></span>` : ''}`;
   // Cuándo se guardó el punto de partida
   RPC_ORIG_FROM('entorno_pruebas').select('maestro_guardado_en, ultimo_reset').eq('id', 1).single().then(({ data }) => {
     const el = $('prpunto'); if (!el) return;
     const fmt = x => new Date(x).toLocaleString('es', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
-    el.textContent = data && data.maestro_guardado_en ? '· Punto de partida: ' + fmt(data.maestro_guardado_en)
-      : '· Aún no hay punto de partida guardado';
+    el.textContent = data && data.maestro_guardado_en ? '· Datos de partida: copia de producción del ' + fmt(data.maestro_guardado_en)
+      : '· Faltan los datos de partida (ejecuta pruebas_punto_fijo.sql)';
     if (!(data && data.maestro_guardado_en)) el.classList.add('falta');
   });
   if (!admin) return;
-  $('prmaestro').onclick = async () => {
-    if (!await preguntar('Se guardará cómo están ahora mismo todos los datos de pruebas (médicos, citas, pedidos, pacientes, productos, configuración…).\n\nA partir de ahí, «Volver al punto de partida» dejará los datos exactamente así, borre lo que se haya hecho después.\n\nSustituye al punto de partida anterior.',
-      { titulo: '¿Guardar este punto de partida?', ok: 'Guardar punto de partida' })) return;
-    const { data: r, error } = await RPC_ORIG('pruebas_guardar_maestro', {});
-    if (error || !r || !r.ok) { toast('No se ha podido guardar: ' + ((error && error.message) || (r && r.error) || ''), true); return; }
-    toast('Punto de partida guardado'); pintarFranjaPruebas();
-  };
   $('prreset').onclick = async () => {
-    const txt = await pedirTexto('Se borrará todo lo que se haya creado o cambiado en pruebas desde el último punto de partida: visitas, citas, pedidos, pacientes, cambios en fichas… y los datos quedarán exactamente como entonces.\n\nNo afecta a producción. Escribe VOLVER para confirmar.', '',
-      { titulo: '¿Volver al punto de partida?', ok: 'Volver al punto de partida' });
+    const txt = await pedirTexto('Se borrará todo lo que se haya creado o cambiado en pruebas (visitas, citas, pedidos, pacientes, cambios en fichas…) y los datos quedarán exactamente como se copiaron de producción.\n\nNo afecta a producción. Escribe VOLVER para confirmar.', '',
+      { titulo: '¿Volver a los datos de partida?', ok: 'Volver a los datos de partida' });
     if (txt === null) return;
     if (txt.trim().toUpperCase() !== 'VOLVER') { toast('No se ha hecho nada: no coincide la palabra', true); return; }
     toast('Volviendo al punto de partida…');
     const { data: r, error } = await RPC_ORIG('pruebas_resetear', { p_confirmacion: 'RESTABLECER' });
     if (error || !r || !r.ok) {
-      toast(r && r.error === 'sin_maestro' ? 'Primero guarda un punto de partida' : 'No se ha podido: ' + ((error && error.message) || (r && r.error) || ''), true);
+      toast(r && r.error === 'sin_maestro' ? 'Faltan los datos de partida: hay que ejecutar pruebas_punto_fijo.sql' : 'No se ha podido: ' + ((error && error.message) || (r && r.error) || ''), true);
       return;
     }
     try { Object.keys(localStorage).filter(k => k.startsWith('dlc-rc-') || k.startsWith('dlc-jornada-')).forEach(k => localStorage.removeItem(k)); } catch (e) {}
-    toast('Datos como en el punto de partida'); setTimeout(() => location.reload(), 600);
+    toast('Datos como al principio'); setTimeout(() => location.reload(), 600);
   };
 }
 
 AYUDA.pruebas = ['Entorno de pruebas', 'Una copia completa de la plataforma con su propia base de datos, para probar sin miedo.', [
   'Todo lo que hagas aquí (visitas, citas, pedidos, cambios en fichas…) se queda aquí: <b>producción no se toca</b>.',
-  '<b>📌 Guardar punto de partida</b>: hace una foto de cómo están ahora todos los datos de pruebas. Úsalo cuando tengas los datos como te interesa empezar las pruebas.',
-  '<b>↺ Volver al punto de partida</b>: deshace todo lo hecho desde la última foto y deja los datos exactamente como entonces. Úsalo al terminar una tanda de pruebas.',
+  'Los <b>datos de partida</b> son una copia de producción. Son fijos: desde la app no se pueden cambiar, así que siempre se puede volver a ellos.',
+  '<b>↺ Volver a los datos de partida</b> deshace todo lo hecho en pruebas y deja los datos exactamente como se copiaron. Úsalo al terminar una tanda de pruebas.',
   'Los usuarios son los mismos que en producción, con la contraseña común de pruebas.',
-  'Para traer datos nuevos de producción, se vuelven a exportar y cargar (lo preparo yo), y después se guarda un nuevo punto de partida.']];
+  'Para tener datos más recientes de producción se hace una nueva copia (lo preparo yo); esa copia pasa a ser los nuevos datos de partida.']];
 
 if (EN_PRUEBAS) {
   pintarFranjaPruebas();
